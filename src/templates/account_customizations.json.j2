@@ -1,0 +1,12 @@
+{
+  "custom_fields": {{ custom_fields | tojson }},
+  {% if sso_user %}
+  "sso_user": {
+    "email": "{{ sso_user.email }}",
+    "first_name": "{{ sso_user.first_name }}",
+    "last_name": "{{ sso_user.last_name }}"
+  }
+  {% else %}
+  "sso_user": null
+  {% endif %}
+} 

@@ -1,0 +1,19 @@
+{
+  "account_name": "sampleaccount",
+  "email": "sample@example.com",
+  "organizational_unit": "Sandbox",
+  "account_tags": {
+    "Environment": "Development",
+    "CostCenter": "12345",
+    "Project": "Sample Project"
+  },
+  "custom_fields": {
+    "vpc_cidr": "10.0.0.0/16",
+    "region": "us-west-2",
+    "enable_flow_logs": "true",
+    "enable_guardduty": "true"
+  },
+  "sso_user_email": "user@example.com",
+  "sso_user_first_name": "Sample",
+  "sso_user_last_name": "User"
+} 

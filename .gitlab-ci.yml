@@ -1,0 +1,217 @@
+stages:
+  - test
+  - validate
+  - deploy-dev
+  - deploy-stage
+  - deploy-prod
+  - aft-deploy
+
+variables:
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+  TF_VAR_gitlab_token: ${GITLAB_TOKEN}
+  PYTHON_VERSION: "3.9"
+
+default:
+  image: python:${PYTHON_VERSION}
+  cache:
+    paths:
+      - .cache/pip
+      - venv/
+
+.install-dependencies:
+  before_script:
+    - python -m pip install --upgrade pip
+    - python -m venv venv
+    - source venv/bin/activate
+    - pip install -r requirements-dev.txt
+
+.terraform-setup:
+  image: hashicorp/terraform:latest
+  before_script:
+    - apt-get update && apt-get install -y unzip curl jq
+    - curl -L "$(curl -s https://api.github.com/repos/terraform-linters/tflint/releases/latest | jq -r '.assets[] | select(.name | contains("linux_amd64")) | .browser_download_url')" -o tflint.zip
+    - unzip tflint.zip && rm tflint.zip
+    - mv tflint /usr/local/bin/
+    - tflint --version
+
+test:
+  stage: test
+  extends: .install-dependencies
+  script:
+    - pytest tests/
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+
+lint:
+  stage: test
+  extends: .install-dependencies
+  script:
+    - flake8 src/ tests/
+    - black --check src/ tests/
+    - isort --check-only src/ tests/
+    - mypy src/
+
+terraform-validate:
+  stage: validate
+  extends: .terraform-setup
+  script:
+    - cd terraform/environments/dev
+    - terraform init -backend=false
+    - terraform validate
+    - tflint
+    - cd ../stage
+    - terraform init -backend=false
+    - terraform validate
+    - tflint
+    - cd ../prod
+    - terraform init -backend=false
+    - terraform validate
+    - tflint
+
+deploy-dev:
+  stage: deploy-dev
+  extends: .terraform-setup
+  script:
+    - cd terraform/environments/dev
+    - terraform init
+    - terraform plan -out=tfplan
+    - terraform apply -auto-approve tfplan
+  environment:
+    name: dev
+  only:
+    - develop
+  when: manual
+
+deploy-stage:
+  stage: deploy-stage
+  extends: .terraform-setup
+  script:
+    - cd terraform/environments/stage
+    - terraform init
+    - terraform plan -out=tfplan
+    - terraform apply -auto-approve tfplan
+  environment:
+    name: stage
+  only:
+    - main
+  when: manual
+  needs:
+    - deploy-dev
+
+deploy-prod:
+  stage: deploy-prod
+  extends: .terraform-setup
+  script:
+    - cd terraform/environments/prod
+    - terraform init
+    - terraform plan -out=tfplan
+    - terraform apply -auto-approve tfplan
+  environment:
+    name: prod
+  only:
+    - tags
+  when: manual
+  needs:
+    - deploy-stage
+
+.aft-setup:
+  image: hashicorp/terraform:latest
+  before_script:
+    - apt-get update && apt-get install -y git python3 python3-pip
+    - pip3 install boto3 requests
+    - git config --global user.email "${GITLAB_USER_EMAIL}"
+    - git config --global user.name "${GITLAB_USER_NAME}"
+
+aft-trigger:
+  stage: aft-deploy
+  extends: .aft-setup
+  script:
+    - |
+      cat > trigger_aft.py << 'EOF'
+      #!/usr/bin/env python3
+      import boto3
+      import json
+      import sys
+      import time
+      
+      def trigger_aft_workflow(account_request_repo):
+          """
+          Trigger AFT workflow by checking for changes in the account request repository
+          and calling the appropriate AFT API to process them.
+          """
+          try:
+              # Get the SSM parameter that stores the AFT execution role
+              ssm = boto3.client('ssm')
+              aft_exec_role_param = ssm.get_parameter(Name='/aft/resources/iam/aft-execution-role-name')
+              aft_exec_role_name = aft_exec_role_param['Parameter']['Value']
+              
+              # Get the account where AFT is deployed
+              aft_mgmt_account_param = ssm.get_parameter(Name='/aft/account/aft-management/account-id')
+              aft_mgmt_account_id = aft_mgmt_account_param['Parameter']['Value']
+              
+              # Assume the AFT execution role to trigger workflows
+              sts = boto3.client('sts')
+              assumed_role = sts.assume_role(
+                  RoleArn=f"arn:aws:iam::{aft_mgmt_account_id}:role/{aft_exec_role_name}",
+                  RoleSessionName="AFTDeploymentSession"
+              )
+              
+              credentials = assumed_role['Credentials']
+              
+              # Create Step Functions client with the assumed role credentials
+              sfn = boto3.client(
+                  'stepfunctions',
+                  aws_access_key_id=credentials['AccessKeyId'],
+                  aws_secret_access_key=credentials['SecretAccessKey'],
+                  aws_session_token=credentials['SessionToken'],
+                  region_name='us-east-1'  # Change to your AFT region
+              )
+              
+              # Get the AFT state machine ARN
+              state_machine_param = ssm.get_parameter(Name='/aft/resources/sfn/account-request-state-machine-arn')
+              state_machine_arn = state_machine_param['Parameter']['Value']
+              
+              # Start execution of the AFT state machine
+              response = sfn.start_execution(
+                  stateMachineArn=state_machine_arn,
+                  name=f"aft-pipeline-trigger-{int(time.time())}",
+                  input=json.dumps({
+                      "account_request_repo": account_request_repo,
+                      "run_mode": "pipeline-triggered"
+                  })
+              )
+              
+              print(f"Successfully triggered AFT workflow: {response['executionArn']}")
+              return True
+          except Exception as e:
+              print(f"Error triggering AFT workflow: {str(e)}")
+              return False
+      
+      if __name__ == "__main__":
+          # Get the AFT account request repository from GitLab variable
+          account_request_repo = "${AFT_ACCOUNT_REQUEST_REPO}"
+          
+          if not account_request_repo:
+              print("Error: AFT_ACCOUNT_REQUEST_REPO variable is not set")
+              sys.exit(1)
+          
+          success = trigger_aft_workflow(account_request_repo)
+          if not success:
+              sys.exit(1)
+      EOF
+    - chmod +x trigger_aft.py
+    - python3 ./trigger_aft.py
+  environment:
+    name: aft
+  only:
+    - tags
+  when: manual
+  needs:
+    - deploy-prod
+  variables:
+    AFT_ACCOUNT_REQUEST_REPO: ${AFT_ACCOUNT_REQUEST_REPO} 
